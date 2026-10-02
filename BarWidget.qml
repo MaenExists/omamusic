@@ -28,7 +28,7 @@ Panel {
   property string currentUrl: ""
   property int currentPositionSec: 0
   property int totalDurationSec: 0
-  property int volume: 100
+  property int volume: 70
 
   // Tabs: "search" | "queue" | "favorites"
   property string activeTab: "search"
@@ -44,18 +44,6 @@ Panel {
 
   // Favorites State
   property var favorites: []
-
-  // Short running track title for the bar: max ~16-20 chars
-  readonly property string shortBarTitle: {
-    var raw = currentTitle.trim()
-    if (!raw) return ""
-    // Strip common YouTube fluff
-    raw = raw.replace(/\s*[\(\[](official\s*)?(audio|video|lyrics|hd|4k)[\)\]]/gi, "").trim()
-    if (raw.length > 18) {
-      return raw.substring(0, 16) + "…"
-    }
-    return raw
-  }
 
   function playSound(name) {
     soundProc.command = [root.backendPath, "sound", name]
@@ -100,13 +88,15 @@ Panel {
     currentUrl = item.url
     isPlaying = true
     isPaused = false
-    execActionWithArg("play-url", item.url)
+    actionProc.command = [root.backendPath, "play-url", item.url, item.title || "", item.artist || "", item.duration || ""]
+    actionProc.running = true
   }
 
   function queueTrack(item) {
     if (!item || !item.url) return
     isBusy = true
-    execActionWithArg("queue-url", item.url)
+    actionProc.command = [root.backendPath, "queue-url", item.url, item.title || "", item.artist || "", item.duration || ""]
+    actionProc.running = true
     Qt.callLater(root.refreshQueue)
   }
 
@@ -178,16 +168,17 @@ Panel {
       if (data.track) {
         root.currentTitle = data.track.title || ""
         root.currentArtist = data.track.artist || ""
-        root.currentUrl = data.track.path || ""
-        root.totalDurationSec = data.track.duration_secs || data.duration || 0
-      } else {
-        root.currentTitle = ""
-        root.currentArtist = ""
-        root.totalDurationSec = 0
+        root.currentUrl = data.track.path || data.track.url || ""
       }
 
+      if (data.duration) {
+        root.totalDurationSec = Math.round(data.duration)
+      }
       if (data.position !== undefined) {
         root.currentPositionSec = Math.round(data.position)
+      }
+      if (data.volume !== undefined) {
+        root.volume = Math.round(data.volume)
       }
     } catch (e) {
       // Ignored
@@ -202,12 +193,12 @@ Panel {
   }
 
   visible: true
-  implicitWidth: barRow.implicitWidth + Style.space(8)
+  implicitWidth: iconContainer.width
   implicitHeight: bar ? bar.barSize : Style.bar.sizeHorizontal
 
   // Periodic polling for status
   Timer {
-    interval: root.opened ? 1500 : (root.isPlaying ? 3000 : 8000)
+    interval: root.opened ? 1200 : (root.isPlaying ? 2500 : 7000)
     running: true
     repeat: true
     onTriggered: {
@@ -336,101 +327,76 @@ Panel {
     function prev(): void { root.prevTrack() }
   }
 
-  // Top Bar Layout: Text BEFORE the Icon
-  Row {
-    id: barRow
+  // Bar Widget: Icon ONLY (Clean, minimal, hover reveals full song details)
+  Item {
+    id: iconContainer
+    width: Style.bar.statusSlot
+    height: Style.bar.statusSlot
     anchors.verticalCenter: parent.verticalCenter
-    spacing: Style.space(6)
 
-    // Running Track Name on the Bar (comes before icon)
-    Item {
-      visible: root.isPlaying && root.shortBarTitle !== ""
-      height: parent.height
-      width: runningText.implicitWidth + Style.space(4)
-      anchors.verticalCenter: parent.verticalCenter
+    Rectangle {
+      id: iconBg
+      anchors.fill: parent
+      radius: width / 2
+      color: root.isPlaying
+        ? Style.selectedFillFor(root.foreground, root.accent)
+        : (barMouse.containsMouse ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.12) : "transparent")
+    }
 
-      Text {
-        id: runningText
-        textFormat: Text.PlainText
-        text: root.shortBarTitle
-        color: root.bar ? root.bar.barForeground : Color.foreground
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.caption
-        anchors.verticalCenter: parent.verticalCenter
-        opacity: 0.88
+    Text {
+      id: iconLabel
+      anchors.centerIn: parent
+      text: root.isBusy ? "󰑮" : (root.isPlaying ? "󱑽" : "󱑼")
+      color: root.isPlaying ? root.accent : (root.bar ? root.bar.barForeground : Color.foreground)
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.icon
+
+      RotationAnimation on rotation {
+        running: root.isBusy || (root.isPlaying && root.activeTab === "search" && root.isSearching)
+        loops: Animation.Infinite
+        from: 0
+        to: 360
+        duration: 1200
       }
     }
 
-    // Unique Styled Music Glyph with Spinner/Dot Indicator
-    Item {
-      width: Style.bar.statusSlot
-      height: Style.bar.statusSlot
-      anchors.verticalCenter: parent.verticalCenter
+    // Glowing accent indicator when playing
+    Rectangle {
+      visible: root.isPlaying && !root.isBusy
+      width: Style.space(5)
+      height: Style.space(5)
+      radius: width / 2
+      color: root.accent
+      anchors.top: parent.top
+      anchors.right: parent.right
+      anchors.topMargin: Style.space(1)
+      anchors.rightMargin: Style.space(1)
+    }
 
-      Rectangle {
-        id: iconBg
-        anchors.fill: parent
-        radius: width / 2
-        color: root.isPlaying
-          ? Style.selectedFillFor(root.foreground, root.accent)
-          : (barMouse.containsMouse ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.12) : "transparent")
-      }
+    MouseArea {
+      id: barMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      acceptedButtons: Qt.LeftButton | Qt.RightButton
+      cursorShape: Qt.PointingHandCursor
 
-      Text {
-        id: iconLabel
-        anchors.centerIn: parent
-        text: root.isBusy ? "󰑮" : (root.isPlaying ? "󱑽" : "󱑼")
-        color: root.isPlaying ? root.accent : (root.bar ? root.bar.barForeground : Color.foreground)
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.icon
-
-        RotationAnimation on rotation {
-          running: root.isBusy || (root.isPlaying && root.activeTab === "search" && root.isSearching)
-          loops: Animation.Infinite
-          from: 0
-          to: 360
-          duration: 1200
+      onEntered: {
+        if (root.bar) {
+          var tip = root.isPlaying
+            ? (root.currentTitle ? (root.currentTitle + (root.currentArtist ? " — " + root.currentArtist : "")) : "Playing music")
+            : (root.isPaused ? "Paused: " + root.currentTitle : "OmaMusic - YouTube Player")
+          root.bar.showTooltip(root, tip)
         }
       }
-
-      // Small glowing indicator dot when playing
-      Rectangle {
-        visible: root.isPlaying && !root.isBusy
-        width: Style.space(5)
-        height: Style.space(5)
-        radius: width / 2
-        color: root.accent
-        anchors.top: parent.top
-        anchors.right: parent.right
-        anchors.topMargin: Style.space(1)
-        anchors.rightMargin: Style.space(1)
+      onExited: {
+        if (root.bar) root.bar.hideTooltip(root)
       }
 
-      MouseArea {
-        id: barMouse
-        anchors.fill: parent
-        hoverEnabled: true
-        acceptedButtons: Qt.LeftButton | Qt.RightButton
-        cursorShape: Qt.PointingHandCursor
-
-        onEntered: {
-          if (root.bar) {
-            var tip = root.isPlaying
-              ? ("OmaMusic: " + (root.currentTitle ? root.currentTitle : "Playing"))
-              : "OmaMusic - YouTube Player"
-            root.bar.showTooltip(root, tip)
-          }
-        }
-        onExited: {
-          if (root.bar) root.bar.hideTooltip(root)
-        }
-
-        onClicked: function(mouse) {
-          if (mouse.button === Qt.RightButton) {
-            root.togglePlayPause()
-          } else {
-            root.toggle()
-          }
+      onClicked: function(mouse) {
+        if (mouse.button === Qt.RightButton) {
+          root.togglePlayPause()
+        } else {
+          root.toggle()
         }
       }
     }
@@ -439,7 +405,7 @@ Panel {
   // Interactive Dropdown Panel
   KeyboardPanel {
     id: panel
-    anchorItem: barRow
+    anchorItem: iconContainer
     owner: root
     bar: root.bar
     open: root.opened
