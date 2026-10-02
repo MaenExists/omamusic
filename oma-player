@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# oma-player: backend bridge for OmaMusic plugin talking to headless cliamp daemon
+set -eo pipefail
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omamusic"
+mkdir -p "$STATE_DIR"
+STATUS_JSON="$STATE_DIR/status.json"
+CACHE_JSON="$STATE_DIR/cache.json"
+
+ensure_daemon() {
+  if ! cliamp status >/dev/null 2>&1; then
+    # Start headless daemon in background with low-power mode
+    cliamp -d --low-power >/dev/null 2>&1 &
+    # Allow socket to bind
+    for _ in {1..20}; do
+      if cliamp status >/dev/null 2>&1; then
+        break
+      fi
+      sleep 0.1
+    done
+  fi
+}
+
+cmd="${1:-status}"
+
+case "$cmd" in
+  ensure)
+    ensure_daemon
+    echo '{"ok":true}'
+    ;;
+
+  status)
+    ensure_daemon
+    # Fetch status via CLI json
+    cli_status=$(cliamp status --json 2>/dev/null || echo '{}')
+    echo "$cli_status" > "$STATUS_JSON.tmp" && mv "$STATUS_JSON.tmp" "$STATUS_JSON"
+    cat "$STATUS_JSON"
+    ;;
+
+  play)
+    ensure_daemon
+    cliamp play >/dev/null 2>&1 || true
+    "$0" status
+    ;;
+
+  pause)
+    ensure_daemon
+    cliamp pause >/dev/null 2>&1 || true
+    "$0" status
+    ;;
+
+  toggle)
+    ensure_daemon
+    cliamp toggle >/dev/null 2>&1 || true
+    "$0" status
+    ;;
+
+  next)
+    ensure_daemon
+    cliamp next >/dev/null 2>&1 || true
+    "$0" status
+    ;;
+
+  prev)
+    ensure_daemon
+    cliamp prev >/dev/null 2>&1 || true
+    "$0" status
+    ;;
+
+  stop)
+    ensure_daemon
+    cliamp stop >/dev/null 2>&1 || true
+    "$0" status
+    ;;
+
+  volume)
+    ensure_daemon
+    val="${2:-0}"
+    # value is dB in range [-30, +6] or convert from 0-100%
+    # If val is 0-100, map 0% -> -30dB, 100% -> 0dB
+    if [ "$val" -gt 0 ] 2>/dev/null; then
+      if [ "$val" -le 100 ]; then
+        # Map 0..100% to -30..0 dB
+        # dB = (percent - 100) * 30 / 100
+        val_db=$(( (val - 100) * 30 / 100 ))
+        cliamp volume "$val_db" >/dev/null 2>&1 || true
+      else
+        cliamp volume 0 >/dev/null 2>&1 || true
+      fi
+    else
+      cliamp volume -30 >/dev/null 2>&1 || true
+    fi
+    "$0" status
+    ;;
+
+  play-url)
+    ensure_daemon
+    url="$2"
+    if [ -n "$url" ]; then
+      cliamp remote call --wait url.load --params "{\"path\":$(printf '%s' "$url" | jq -R .),\"play\":true}" >/dev/null 2>&1 || true
+    fi
+    "$0" status
+    ;;
+
+  queue-url)
+    ensure_daemon
+    url="$2"
+    if [ -n "$url" ]; then
+      cliamp remote call --wait url.load --params "{\"path\":$(printf '%s' "$url" | jq -R .),\"play\":false}" >/dev/null 2>&1 || true
+    fi
+    "$0" status
+    ;;
+
+  search)
+    query="$2"
+    limit="${3:-8}"
+    if [ -z "$query" ]; then
+      echo '{"ok":true,"results":[]}'
+      exit 0
+    fi
+
+    # Perform fast ytsearch with yt-dlp
+    results=$(yt-dlp --default-search "ytsearch$limit" \
+      --dump-json \
+      --no-playlist \
+      --no-warnings \
+      "ytsearch$limit:$query" 2>/dev/null \
+      | jq -s -c 'map({
+          id: .id,
+          title: (.title // "Unknown"),
+          artist: (.uploader // .channel // "Unknown"),
+          duration: (.duration_string // ""),
+          duration_secs: (.duration // 0),
+          url: (.webpage_url // ("https://www.youtube.com/watch?v=" + .id))
+        })') || results="[]"
+
+    if [ -z "$results" ] || [ "$results" = "null" ]; then
+      results="[]"
+    fi
+
+    jq -n -c --argjson items "$results" '{ok: true, results: $items}'
+    ;;
+
+  *)
+    echo "Usage: $0 {ensure|status|play|pause|toggle|next|prev|stop|volume <0-100>|play-url <url>|queue-url <url>|search <query> [limit]}"
+    exit 1
+    ;;
+esac
