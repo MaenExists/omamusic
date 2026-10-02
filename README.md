@@ -1,43 +1,53 @@
-# OmaMusic 󰎆
+# OmaMusic 󱑽
 
 A minimalist, lightweight YouTube & online music player plugin for **Omarchy OS**.
 
-OmaMusic docks into the Omarchy top bar, providing an instant-access dropdown widget for searching, playing, and queueing YouTube audio with minimal CPU/RAM footprint.
+OmaMusic docks seamlessly into your Omarchy status bar with a unique animated icon, compact running track title positioned before the glyph, instant search, queue inspection, favorite tracks, sound effects, and session restart controls.
 
 ---
 
 ## ✨ Features
 
-- **Top Bar Integration**: Displays current playback status, animated icons (`󰎆`/`󰝚`), and rich now-playing tooltips.
-- **Instant Search Dropdown**: Click the bar icon (or trigger via hotkey/IPC) to open a keyboard-navigable search interface for YouTube Music and online audio streams.
-- **Rich Controls**: Play/pause, track navigation, interactive volume slider, and one-click queueing.
-- **Ultra Low Resource Footprint**: Uses `cliamp` running in headless low-power daemon mode (`--daemon --low-power`) paired with `yt-dlp` stream extraction.
-- **Native Look & Feel**: Built directly with Omarchy's Quickshell theme tokens and design system (`qs.Commons`, `qs.Ui`, `KeyboardPanel`).
+- **Unique Bar Widget with Leading Track Title**:
+  - Compact running title shown directly **before** the music glyph on the bar.
+  - Custom stylized glyph (`󱑽` / `󱑼`) with active glowing indicator dot and spinner when loading/busy.
+  - Hover tooltip displaying full now-playing title and artist.
+- **Interactive Control Tabs**:
+  - **󰍉 Search**: Direct YouTube search with instant stream loading.
+  - **󰒮 Queue**: Look up your current playlist queue, active track indicator, and one-click queue clearing.
+  - **󰋑 Favorites**: Save favorite tracks with one click and play them back anytime.
+- **Session & Daemon Management**:
+  - **Restart Session Button (`󰑐`)**: Cleanly restarts the background audio daemon and resets YouTube bot/rate limits without losing your bar icon or widget placement.
+  - Clears default placeholder tracks automatically on launch.
+- **Audio Feedback**: Subtle desktop sound effects for play, pause, queueing, favoriting, and session restarts.
+- **Minimal Keyboard Shortcuts Hint Bar**: Clean, non-intrusive shortcut hints pinned to the bottom of the widget (`↵ Play`, `↑/↓ Navigate`, `Esc Close`).
+- **Ultra Low Resource Footprint**: Built on `cliamp --daemon --low-power` with `yt-dlp` stream extraction (<20MB RAM, ~0% idle CPU).
 
 ---
 
 ## 🛠️ Requirements
 
 - **Omarchy OS** (Hyprland + Quickshell)
-- `cliamp` (shipped with Omarchy)
+- `cliamp` (pre-installed on Omarchy)
 - `yt-dlp` (for YouTube search & audio stream resolution)
 - `jq`
+- `canberra-gtk-play` (for feedback sound effects)
 
 ---
 
 ## 🚀 Installation
 
-### Option 1: Automatic Install / Symlink
+### Option 1: Symlink from source (Active development)
 
 ```bash
 git clone https://github.com/MaenExists/omamusic.git ~/Builds/OmaMusic
 mkdir -p ~/.config/omarchy/plugins
-ln -s ~/Builds/OmaMusic ~/.config/omarchy/plugins/maen.omamusic
+ln -sfn ~/Builds/OmaMusic ~/.config/omarchy/plugins/maen.omamusic
 ```
 
 ### Option 2: Add to Omarchy Bar
 
-Edit `~/.config/omarchy/shell.json` to include `maen.omamusic` in your status bar:
+Ensure `maen.omamusic` is in your `~/.config/omarchy/shell.json`:
 
 ```json
 {
@@ -52,16 +62,18 @@ Edit `~/.config/omarchy/shell.json` to include `maen.omamusic` in your status ba
 }
 ```
 
-Omarchy will hot-reload automatically without requiring a shell restart!
+Omarchy shell hot-reloads on save automatically!
 
 ---
 
-## 🎮 Usage
+## 🎮 Usage & Controls
 
-- **Click Icon**: Toggle the OmaMusic dropdown panel.
-- **Right-Click Icon**: Quickly toggle Play / Pause.
-- **Search**: Enter song name or artist in the search box, press `Enter`.
-- **Keyboard Navigation**: Use `Up`/`Down` arrows to navigate search results, `Enter` to play, or click `󰐍` to queue next.
+- **Left-Click Bar Icon**: Toggle the OmaMusic interactive popup.
+- **Right-Click Bar Icon**: Instantly toggle Play / Pause without opening the widget.
+- **Search Tab**: Type any song or artist, press `Enter` to search, and click or press `Enter` on a result to play.
+- **Queue Tab**: View currently loaded playlist tracks and clear the queue with `󰅖`.
+- **Favorites Tab**: Click `󰋔` on any song to bookmark it into Favorites.
+- **Restart Session**: Click `󰑐` in the top right of the popup to refresh the background daemon.
 
 ---
 
