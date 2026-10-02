@@ -12,8 +12,8 @@ Panel {
   manageIpc: false
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
-  readonly property color dim: Qt.darker(foreground, 1.5)
-  readonly property color muted: Qt.darker(foreground, 1.8)
+  readonly property color dim: Qt.darker(foreground, 1.45)
+  readonly property color muted: Qt.darker(foreground, 1.85)
   readonly property color accent: Color.accent
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property string backendPath: Qt.resolvedUrl("oma-player").toString().replace(/^file:\/\//, "")
@@ -22,40 +22,82 @@ Panel {
   // Player State
   property bool isPlaying: false
   property bool isPaused: false
+  property bool isBusy: false
   property string currentTitle: ""
   property string currentArtist: ""
-  property string currentDuration: ""
+  property string currentUrl: ""
   property int currentPositionSec: 0
   property int totalDurationSec: 0
   property int volume: 100
+
+  // Tabs: "search" | "queue" | "favorites"
+  property string activeTab: "search"
 
   // Search State
   property var searchResults: []
   property bool isSearching: false
   property string lastQuery: ""
-  property int selectedIndex: 0
+
+  // Queue State
+  property var queueTracks: []
+  property int queueIndex: -1
+
+  // Favorites State
+  property var favorites: []
+
+  // Short running track title for the bar: max ~16-20 chars
+  readonly property string shortBarTitle: {
+    var raw = currentTitle.trim()
+    if (!raw) return ""
+    // Strip common YouTube fluff
+    raw = raw.replace(/\s*[\(\[](official\s*)?(audio|video|lyrics|hd|4k)[\)\]]/gi, "").trim()
+    if (raw.length > 18) {
+      return raw.substring(0, 16) + "…"
+    }
+    return raw
+  }
+
+  function playSound(name) {
+    soundProc.command = [root.backendPath, "sound", name]
+    soundProc.running = true
+  }
 
   function refreshStatus() {
     if (statusProc.running) return
     statusProc.running = true
   }
 
+  function refreshQueue() {
+    if (queueProc.running) return
+    queueProc.running = true
+  }
+
+  function refreshFavorites() {
+    if (favProc.running) return
+    favProc.running = true
+  }
+
   function togglePlayPause() {
+    isBusy = true
     execAction("toggle")
   }
 
   function nextTrack() {
+    isBusy = true
     execAction("next")
   }
 
   function prevTrack() {
+    isBusy = true
     execAction("prev")
   }
 
   function playTrack(item) {
     if (!item || !item.url) return
+    isBusy = true
     currentTitle = item.title || "Loading..."
     currentArtist = item.artist || ""
+    currentUrl = item.url
     isPlaying = true
     isPaused = false
     execActionWithArg("play-url", item.url)
@@ -63,7 +105,42 @@ Panel {
 
   function queueTrack(item) {
     if (!item || !item.url) return
+    isBusy = true
     execActionWithArg("queue-url", item.url)
+    Qt.callLater(root.refreshQueue)
+  }
+
+  function clearQueue() {
+    execAction("queue-clear")
+    queueTracks = []
+    queueIndex = -1
+  }
+
+  function restartSession() {
+    isBusy = true
+    currentTitle = ""
+    currentArtist = ""
+    isPlaying = false
+    isPaused = false
+    execAction("restart-session")
+    root.refreshQueue()
+    root.refreshFavorites()
+  }
+
+  function toggleFavorite(item) {
+    if (!item) return
+    var jsonStr = JSON.stringify(item)
+    favToggleProc.command = [root.backendPath, "favorites-toggle", jsonStr]
+    favToggleProc.running = true
+  }
+
+  function isTrackFavorite(item) {
+    if (!item) return false
+    var key = item.id || item.url || ""
+    for (var i = 0; i < favorites.length; i++) {
+      if ((favorites[i].id || favorites[i].url) === key) return true
+    }
+    return false
   }
 
   function setVolume(pct) {
@@ -76,7 +153,6 @@ Panel {
     if (!trimmed || trimmed === lastQuery) return
     lastQuery = trimmed
     isSearching = true
-    selectedIndex = 0
     searchProc.query = trimmed
     searchProc.running = true
   }
@@ -97,10 +173,12 @@ Panel {
       var data = JSON.parse(raw)
       root.isPlaying = data.state === "playing"
       root.isPaused = data.state === "paused"
+      root.isBusy = false
 
       if (data.track) {
         root.currentTitle = data.track.title || ""
         root.currentArtist = data.track.artist || ""
+        root.currentUrl = data.track.path || ""
         root.totalDurationSec = data.track.duration_secs || data.duration || 0
       } else {
         root.currentTitle = ""
@@ -124,18 +202,24 @@ Panel {
   }
 
   visible: true
-  implicitWidth: barButton.implicitWidth
-  implicitHeight: barButton.implicitHeight
+  implicitWidth: barRow.implicitWidth + Style.space(8)
+  implicitHeight: bar ? bar.barSize : Style.bar.sizeHorizontal
 
-  // Periodic polling for playback position & state while open or playing
+  // Periodic polling for status
   Timer {
     interval: root.opened ? 1500 : (root.isPlaying ? 3000 : 8000)
     running: true
     repeat: true
-    onTriggered: root.refreshStatus()
+    onTriggered: {
+      root.refreshStatus()
+      if (root.opened) {
+        if (root.activeTab === "queue") root.refreshQueue()
+        if (root.activeTab === "favorites") root.refreshFavorites()
+      }
+    }
   }
 
-  // File watcher for status file written by oma-player
+  // File watcher for status file
   FileView {
     path: root.statusPath
     watchChanges: true
@@ -158,6 +242,67 @@ Panel {
     id: actionProc
     command: []
     onExited: root.refreshStatus()
+  }
+
+  Process {
+    id: soundProc
+    command: []
+  }
+
+  Process {
+    id: queueProc
+    command: [root.backendPath, "queue-list"]
+    stdout: StdioCollector {
+      id: queueOut
+      waitForEnd: true
+    }
+    onExited: function(exitCode) {
+      if (exitCode === 0 && queueOut.text) {
+        try {
+          var parsed = JSON.parse(queueOut.text)
+          root.queueTracks = parsed.tracks || []
+          root.queueIndex = parsed.currentIndex !== undefined ? parsed.currentIndex : -1
+        } catch (e) {
+          root.queueTracks = []
+        }
+      }
+    }
+  }
+
+  Process {
+    id: favProc
+    command: [root.backendPath, "favorites-list"]
+    stdout: StdioCollector {
+      id: favOut
+      waitForEnd: true
+    }
+    onExited: function(exitCode) {
+      if (exitCode === 0 && favOut.text) {
+        try {
+          root.favorites = JSON.parse(favOut.text) || []
+        } catch (e) {
+          root.favorites = []
+        }
+      }
+    }
+  }
+
+  Process {
+    id: favToggleProc
+    command: []
+    stdout: StdioCollector {
+      id: favToggleOut
+      waitForEnd: true
+    }
+    onExited: function(exitCode) {
+      if (exitCode === 0 && favToggleOut.text) {
+        try {
+          root.favorites = JSON.parse(favToggleOut.text) || []
+        } catch (e) {
+          // Ignored
+        }
+      }
+    }
   }
 
   Process {
@@ -191,21 +336,102 @@ Panel {
     function prev(): void { root.prevTrack() }
   }
 
-  // Status Bar Icon
-  BarIconButton {
-    id: barButton
-    anchors.fill: parent
-    bar: root.bar
-    text: root.isPlaying ? "󰎆" : "󰝚"
-    tooltipText: root.isPlaying
-      ? (root.currentTitle ? "Playing: " + root.currentTitle + (root.currentArtist ? " - " + root.currentArtist : "") : "Playing music")
-      : (root.isPaused ? "Paused: " + root.currentTitle : "OmaMusic - YouTube Player")
+  // Top Bar Layout: Text BEFORE the Icon
+  Row {
+    id: barRow
+    anchors.verticalCenter: parent.verticalCenter
+    spacing: Style.space(6)
 
-    onPressed: function(mouse) {
-      if (mouse === Qt.RightButton) {
-        root.togglePlayPause()
-      } else {
-        root.toggle()
+    // Running Track Name on the Bar (comes before icon)
+    Item {
+      visible: root.isPlaying && root.shortBarTitle !== ""
+      height: parent.height
+      width: runningText.implicitWidth + Style.space(4)
+      anchors.verticalCenter: parent.verticalCenter
+
+      Text {
+        id: runningText
+        textFormat: Text.PlainText
+        text: root.shortBarTitle
+        color: root.bar ? root.bar.barForeground : Color.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        anchors.verticalCenter: parent.verticalCenter
+        opacity: 0.88
+      }
+    }
+
+    // Unique Styled Music Glyph with Spinner/Dot Indicator
+    Item {
+      width: Style.bar.statusSlot
+      height: Style.bar.statusSlot
+      anchors.verticalCenter: parent.verticalCenter
+
+      Rectangle {
+        id: iconBg
+        anchors.fill: parent
+        radius: width / 2
+        color: root.isPlaying
+          ? Style.selectedFillFor(root.foreground, root.accent)
+          : (barMouse.containsMouse ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.12) : "transparent")
+      }
+
+      Text {
+        id: iconLabel
+        anchors.centerIn: parent
+        text: root.isBusy ? "󰑮" : (root.isPlaying ? "󱑽" : "󱑼")
+        color: root.isPlaying ? root.accent : (root.bar ? root.bar.barForeground : Color.foreground)
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.icon
+
+        RotationAnimation on rotation {
+          running: root.isBusy || (root.isPlaying && root.activeTab === "search" && root.isSearching)
+          loops: Animation.Infinite
+          from: 0
+          to: 360
+          duration: 1200
+        }
+      }
+
+      // Small glowing indicator dot when playing
+      Rectangle {
+        visible: root.isPlaying && !root.isBusy
+        width: Style.space(5)
+        height: Style.space(5)
+        radius: width / 2
+        color: root.accent
+        anchors.top: parent.top
+        anchors.right: parent.right
+        anchors.topMargin: Style.space(1)
+        anchors.rightMargin: Style.space(1)
+      }
+
+      MouseArea {
+        id: barMouse
+        anchors.fill: parent
+        hoverEnabled: true
+        acceptedButtons: Qt.LeftButton | Qt.RightButton
+        cursorShape: Qt.PointingHandCursor
+
+        onEntered: {
+          if (root.bar) {
+            var tip = root.isPlaying
+              ? ("OmaMusic: " + (root.currentTitle ? root.currentTitle : "Playing"))
+              : "OmaMusic - YouTube Player"
+            root.bar.showTooltip(root, tip)
+          }
+        }
+        onExited: {
+          if (root.bar) root.bar.hideTooltip(root)
+        }
+
+        onClicked: function(mouse) {
+          if (mouse.button === Qt.RightButton) {
+            root.togglePlayPause()
+          } else {
+            root.toggle()
+          }
+        }
       }
     }
   }
@@ -213,30 +439,30 @@ Panel {
   // Interactive Dropdown Panel
   KeyboardPanel {
     id: panel
-    anchorItem: barButton
+    anchorItem: barRow
     owner: root
     bar: root.bar
     open: root.opened
     focusTarget: searchField
-    contentWidth: panel.fittedContentWidth(Style.space(380))
-    contentHeight: panel.fittedContentHeight(mainColumn.implicitHeight, Style.space(520))
+    contentWidth: panel.fittedContentWidth(Style.space(390))
+    contentHeight: panel.fittedContentHeight(mainColumn.implicitHeight, Style.space(560))
 
     Column {
       id: mainColumn
       width: parent.width
       spacing: Style.space(10)
       topPadding: Style.space(12)
-      bottomPadding: Style.space(14)
+      bottomPadding: Style.space(10)
       leftPadding: Style.space(14)
       rightPadding: Style.space(14)
 
-      // Header row with Title and close action
+      // Header row with Title, Tab switcher, Restart & Close session buttons
       Row {
         width: parent.width - Style.space(28)
         spacing: Style.space(8)
 
         Text {
-          text: "󰎆 OmaMusic"
+          text: "󱑽 OmaMusic"
           color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.title
@@ -245,57 +471,81 @@ Panel {
         }
 
         Item {
-          width: parent.width - x - closeBtn.width
+          width: parent.width - x - restartBtn.width - closeBtn.width - Style.space(8)
           height: 1
         }
 
+        // Restart Instance/Session Button
+        PanelActionButton {
+          id: restartBtn
+          iconText: "󰑐"
+          tooltipText: "Restart Session (clears audio daemon & resets bot limits)"
+          anchors.verticalCenter: parent.verticalCenter
+          onClicked: root.restartSession()
+        }
+
+        // Close dropdown
         PanelActionButton {
           id: closeBtn
           iconText: "󰅖"
-          tooltipText: "Close"
+          tooltipText: "Close Panel"
           anchors.verticalCenter: parent.verticalCenter
           onClicked: root.close()
         }
       }
 
-      // Search Bar
+      // Tab switcher bar: Search | Queue | Favorites
       Row {
         width: parent.width - Style.space(28)
-        spacing: Style.space(8)
+        spacing: Style.space(6)
 
-        TextField {
-          id: searchField
-          width: parent.width - searchActionBtn.width - Style.space(8)
-          placeholderText: "Search YouTube Music..."
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.body
+        Repeater {
+          model: [
+            { id: "search", name: "󰍉 Search" },
+            { id: "queue", name: "󰒮 Queue (" + root.queueTracks.length + ")" },
+            { id: "favorites", name: "󰋑 Favorites (" + root.favorites.length + ")" }
+          ]
 
-          onAccepted: {
-            root.startSearch(text)
-          }
+          Rectangle {
+            width: (parent.width - Style.space(12)) / 3
+            height: Style.space(28)
+            radius: Style.cornerRadius
+            color: root.activeTab === modelData.id
+              ? Style.selectedFillFor(root.foreground, root.accent)
+              : (tabMouse.containsMouse ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.08) : "transparent")
 
-          Keys.onDownPressed: {
-            if (resultsList.count > 0) {
-              resultsList.forceActiveFocus()
-              resultsList.currentIndex = 0
+            border.color: root.activeTab === modelData.id ? root.accent : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.15)
+            border.width: 1
+
+            Text {
+              anchors.centerIn: parent
+              text: modelData.name
+              color: root.activeTab === modelData.id ? root.foreground : root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              font.bold: root.activeTab === modelData.id
+            }
+
+            MouseArea {
+              id: tabMouse
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: {
+                root.activeTab = modelData.id
+                root.playSound("click")
+                if (root.activeTab === "queue") root.refreshQueue()
+                if (root.activeTab === "favorites") root.refreshFavorites()
+              }
             }
           }
-          Keys.onEscapePressed: root.close()
-        }
-
-        PanelActionButton {
-          id: searchActionBtn
-          iconText: root.isSearching ? "󰑮" : "󰍉"
-          tooltipText: "Search"
-          anchors.verticalCenter: parent.verticalCenter
-          onClicked: root.startSearch(searchField.text)
         }
       }
 
-      // Now Playing Hero Card
+      // Now Playing Hero Card (Visible across all tabs)
       Rectangle {
         width: parent.width - Style.space(28)
-        height: root.currentTitle ? Style.space(104) : Style.space(56)
+        height: root.currentTitle ? Style.space(106) : Style.space(56)
         radius: Style.cornerRadius
         color: Style.selectedFillFor(root.foreground, root.accent)
         clip: true
@@ -305,39 +555,55 @@ Panel {
           anchors.margins: Style.space(10)
           spacing: Style.space(4)
 
-          // Track title & artist
-          Text {
+          // Track Title with Favorite toggle button
+          Row {
             width: parent.width
-            text: root.currentTitle ? root.currentTitle : "No song playing"
-            color: root.foreground
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.body
-            font.bold: true
-            elide: Text.ElideRight
+            spacing: Style.space(6)
+
+            Text {
+              width: parent.width - (root.currentTitle ? favHeaderBtn.width + Style.space(6) : 0)
+              text: root.currentTitle ? root.currentTitle : "No song playing"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              font.bold: true
+              elide: Text.ElideRight
+              anchors.verticalCenter: parent.verticalCenter
+            }
+
+            PanelActionButton {
+              id: favHeaderBtn
+              visible: root.currentTitle !== ""
+              iconText: root.isTrackFavorite({ id: root.currentUrl, url: root.currentUrl }) ? "󰋑" : "󰋔"
+              tooltipText: "Favorite track"
+              size: Style.space(22)
+              anchors.verticalCenter: parent.verticalCenter
+              onClicked: {
+                root.toggleFavorite({
+                  id: root.currentUrl,
+                  title: root.currentTitle,
+                  artist: root.currentArtist,
+                  url: root.currentUrl,
+                  duration: root.formatTime(root.totalDurationSec)
+                })
+              }
+            }
           }
 
+          // Artist & Duration
           Text {
             width: parent.width
-            text: root.currentArtist ? root.currentArtist : "Search songs or artists above"
+            text: root.currentArtist ? (root.currentArtist + (root.totalDurationSec > 0 ? "  ·  " + root.formatTime(root.currentPositionSec) + " / " + root.formatTime(root.totalDurationSec) : "")) : "Search tracks or pick from favorites below"
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             elide: Text.ElideRight
           }
 
-          // Progress text (if duration known)
-          Text {
-            visible: root.totalDurationSec > 0
-            text: root.formatTime(root.currentPositionSec) + " / " + root.formatTime(root.totalDurationSec)
-            color: root.muted
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-          }
-
-          // Playback Controls Row
+          // Media Controls Row
           Row {
             visible: root.currentTitle !== ""
-            spacing: Style.space(12)
+            spacing: Style.space(14)
             anchors.horizontalCenter: parent.horizontalCenter
 
             PanelActionButton {
@@ -347,7 +613,7 @@ Panel {
             }
 
             PanelActionButton {
-              iconText: root.isPlaying ? "󰏤" : "󰐊"
+              iconText: root.isBusy ? "󰑮" : (root.isPlaying ? "󰏤" : "󰐊")
               tooltipText: root.isPlaying ? "Pause" : "Play"
               onClicked: root.togglePlayPause()
             }
@@ -361,7 +627,7 @@ Panel {
         }
       }
 
-      // Volume Row
+      // Volume Slider
       Row {
         width: parent.width - Style.space(28)
         spacing: Style.space(8)
@@ -398,123 +664,398 @@ Panel {
         width: parent.width - Style.space(28)
       }
 
-      // Search Results Section
-      PanelSectionHeader {
-        width: parent.width - Style.space(28)
-        text: root.isSearching ? "SEARCHING YOUTUBE..." : (root.searchResults.length > 0 ? "SEARCH RESULTS" : "FEATURED & SEARCH")
-      }
+      // TAB 1: SEARCH
+      Column {
+        visible: root.activeTab === "search"
+        width: parent.width
+        spacing: Style.space(8)
 
-      ListView {
-        id: resultsList
-        width: parent.width - Style.space(28)
-        height: Math.min(Style.space(220), count * Style.space(48))
-        clip: true
-        model: root.searchResults
+        // Search Input Row
+        Row {
+          width: parent.width - Style.space(28)
+          spacing: Style.space(8)
 
-        Keys.onUpPressed: {
-          if (currentIndex === 0) searchField.forceActiveFocus()
-          else currentIndex--
-        }
-        Keys.onDownPressed: {
-          if (currentIndex < count - 1) currentIndex++
-        }
-        Keys.onReturnPressed: {
-          var item = model[currentIndex]
-          if (item) root.playTrack(item)
-        }
-        Keys.onEscapePressed: root.close()
+          TextField {
+            id: searchField
+            width: parent.width - searchActionBtn.width - Style.space(8)
+            placeholderText: "Search YouTube Music..."
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
 
-        delegate: Rectangle {
-          width: resultsList.width
-          height: Style.space(44)
-          radius: Style.cornerRadius
-          color: resultsList.currentIndex === index
-            ? Style.selectedFillFor(root.foreground, root.accent)
-            : (mouseArea.containsMouse ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.08) : "transparent")
-
-          MouseArea {
-            id: mouseArea
-            anchors.fill: parent
-            hoverEnabled: true
-            onClicked: {
-              resultsList.currentIndex = index
-              root.playTrack(modelData)
+            onAccepted: root.startSearch(text)
+            Keys.onDownPressed: {
+              if (resultsList.count > 0) {
+                resultsList.forceActiveFocus()
+                resultsList.currentIndex = 0
+              }
             }
+            Keys.onEscapePressed: root.close()
           }
 
-          Row {
-            anchors.fill: parent
-            anchors.leftMargin: Style.space(8)
-            anchors.rightMargin: Style.space(8)
-            spacing: Style.space(8)
+          PanelActionButton {
+            id: searchActionBtn
+            iconText: root.isSearching ? "󰑮" : "󰍉"
+            tooltipText: "Search"
+            anchors.verticalCenter: parent.verticalCenter
+            onClicked: root.startSearch(searchField.text)
+          }
+        }
 
-            Text {
-              text: "󰐊"
-              color: resultsList.currentIndex === index ? root.foreground : root.muted
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              anchors.verticalCenter: parent.verticalCenter
+        // Search Results List
+        ListView {
+          id: resultsList
+          width: parent.width - Style.space(28)
+          height: Math.min(Style.space(190), Math.max(Style.space(48), count * Style.space(46)))
+          clip: true
+          model: root.searchResults
+
+          Keys.onUpPressed: {
+            if (currentIndex === 0) searchField.forceActiveFocus()
+            else currentIndex--
+          }
+          Keys.onDownPressed: {
+            if (currentIndex < count - 1) currentIndex++
+          }
+          Keys.onReturnPressed: {
+            var item = model[currentIndex]
+            if (item) root.playTrack(item)
+          }
+          Keys.onEscapePressed: root.close()
+
+          delegate: Rectangle {
+            width: resultsList.width
+            height: Style.space(44)
+            radius: Style.cornerRadius
+            color: resultsList.currentIndex === index
+              ? Style.selectedFillFor(root.foreground, root.accent)
+              : (mouseArea.containsMouse ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.08) : "transparent")
+
+            MouseArea {
+              id: mouseArea
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: {
+                resultsList.currentIndex = index
+                root.playTrack(modelData)
+              }
             }
 
-            Column {
-              width: parent.width - playQueueBtn.width - timeText.width - Style.space(36)
-              anchors.verticalCenter: parent.verticalCenter
-              spacing: Style.space(2)
+            Row {
+              anchors.fill: parent
+              anchors.leftMargin: Style.space(8)
+              anchors.rightMargin: Style.space(8)
+              spacing: Style.space(8)
 
               Text {
-                width: parent.width
-                text: modelData.title || ""
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.body
-                elide: Text.ElideRight
-              }
-
-              Text {
-                width: parent.width
-                text: modelData.artist || ""
-                color: root.dim
+                text: "󰐊"
+                color: resultsList.currentIndex === index ? root.foreground : root.muted
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
-                elide: Text.ElideRight
+                anchors.verticalCenter: parent.verticalCenter
               }
-            }
 
-            Text {
-              id: timeText
-              text: modelData.duration || ""
-              color: root.muted
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              anchors.verticalCenter: parent.verticalCenter
-            }
+              Column {
+                width: parent.width - queueBtn.width - favRowBtn.width - timeText.width - Style.space(40)
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(2)
 
-            PanelActionButton {
-              id: playQueueBtn
-              iconText: "󰐍"
-              tooltipText: "Add to Queue"
-              size: Style.space(26)
-              anchors.verticalCenter: parent.verticalCenter
-              onClicked: root.queueTrack(modelData)
+                Text {
+                  width: parent.width
+                  text: modelData.title || ""
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                  elide: Text.ElideRight
+                }
+
+                Text {
+                  width: parent.width
+                  text: modelData.artist || ""
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  elide: Text.ElideRight
+                }
+              }
+
+              Text {
+                id: timeText
+                text: modelData.duration || ""
+                color: root.muted
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                anchors.verticalCenter: parent.verticalCenter
+              }
+
+              PanelActionButton {
+                id: favRowBtn
+                iconText: root.isTrackFavorite(modelData) ? "󰋑" : "󰋔"
+                tooltipText: "Favorite"
+                size: Style.space(24)
+                anchors.verticalCenter: parent.verticalCenter
+                onClicked: root.toggleFavorite(modelData)
+              }
+
+              PanelActionButton {
+                id: queueBtn
+                iconText: "󰐍"
+                tooltipText: "Queue Next"
+                size: Style.space(24)
+                anchors.verticalCenter: parent.verticalCenter
+                onClicked: root.queueTrack(modelData)
+              }
             }
           }
         }
+
+        Text {
+          visible: !root.isSearching && root.searchResults.length === 0
+          text: "Type a track name above and press Enter."
+          color: root.muted
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          horizontalAlignment: Text.AlignHCenter
+          width: parent.width - Style.space(28)
+        }
       }
 
-      // Empty State Prompt
-      Text {
-        visible: !root.isSearching && root.searchResults.length === 0
-        text: "Type a track, artist, or album name above\nand press Enter to search & stream directly."
-        color: root.muted
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.caption
-        horizontalAlignment: Text.AlignHCenter
+      // TAB 2: QUEUE
+      Column {
+        visible: root.activeTab === "queue"
+        width: parent.width
+        spacing: Style.space(8)
+
+        Row {
+          width: parent.width - Style.space(28)
+          Text {
+            text: "NOW PLAYING QUEUE"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            font.bold: true
+            anchors.verticalCenter: parent.verticalCenter
+          }
+          Item {
+            width: parent.width - x - clearQBtn.width
+            height: 1
+          }
+          PanelActionButton {
+            id: clearQBtn
+            iconText: "󰅖"
+            tooltipText: "Clear Queue"
+            size: Style.space(22)
+            anchors.verticalCenter: parent.verticalCenter
+            onClicked: root.clearQueue()
+          }
+        }
+
+        ListView {
+          id: queueList
+          width: parent.width - Style.space(28)
+          height: Math.min(Style.space(190), Math.max(Style.space(48), count * Style.space(46)))
+          clip: true
+          model: root.queueTracks
+
+          delegate: Rectangle {
+            width: queueList.width
+            height: Style.space(44)
+            radius: Style.cornerRadius
+            color: root.queueIndex === index
+              ? Style.selectedFillFor(root.foreground, root.accent)
+              : (qMouse.containsMouse ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.08) : "transparent")
+
+            MouseArea {
+              id: qMouse
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.playTrack(modelData)
+            }
+
+            Row {
+              anchors.fill: parent
+              anchors.leftMargin: Style.space(8)
+              anchors.rightMargin: Style.space(8)
+              spacing: Style.space(8)
+
+              Text {
+                text: root.queueIndex === index ? "󰐊" : String(index + 1)
+                color: root.queueIndex === index ? root.accent : root.muted
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                anchors.verticalCenter: parent.verticalCenter
+              }
+
+              Column {
+                width: parent.width - Style.space(40)
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(2)
+
+                Text {
+                  width: parent.width
+                  text: modelData.title || ""
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                  elide: Text.ElideRight
+                }
+
+                Text {
+                  width: parent.width
+                  text: modelData.artist || ""
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  elide: Text.ElideRight
+                }
+              }
+            }
+          }
+        }
+
+        Text {
+          visible: root.queueTracks.length === 0
+          text: "Queue is empty. Search tracks and click 󰐍 to add."
+          color: root.muted
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          horizontalAlignment: Text.AlignHCenter
+          width: parent.width - Style.space(28)
+        }
+      }
+
+      // TAB 3: FAVORITES
+      Column {
+        visible: root.activeTab === "favorites"
+        width: parent.width
+        spacing: Style.space(8)
+
+        ListView {
+          id: favList
+          width: parent.width - Style.space(28)
+          height: Math.min(Style.space(190), Math.max(Style.space(48), count * Style.space(46)))
+          clip: true
+          model: root.favorites
+
+          delegate: Rectangle {
+            width: favList.width
+            height: Style.space(44)
+            radius: Style.cornerRadius
+            color: favMouse.containsMouse ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.08) : "transparent"
+
+            MouseArea {
+              id: favMouse
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.playTrack(modelData)
+            }
+
+            Row {
+              anchors.fill: parent
+              anchors.leftMargin: Style.space(8)
+              anchors.rightMargin: Style.space(8)
+              spacing: Style.space(8)
+
+              Text {
+                text: "󰋑"
+                color: root.accent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                anchors.verticalCenter: parent.verticalCenter
+              }
+
+              Column {
+                width: parent.width - favDelBtn.width - Style.space(36)
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(2)
+
+                Text {
+                  width: parent.width
+                  text: modelData.title || ""
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                  elide: Text.ElideRight
+                }
+
+                Text {
+                  width: parent.width
+                  text: modelData.artist || ""
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  elide: Text.ElideRight
+                }
+              }
+
+              PanelActionButton {
+                id: favDelBtn
+                iconText: "󰅖"
+                tooltipText: "Remove Favorite"
+                size: Style.space(22)
+                anchors.verticalCenter: parent.verticalCenter
+                onClicked: root.toggleFavorite(modelData)
+              }
+            }
+          }
+        }
+
+        Text {
+          visible: root.favorites.length === 0
+          text: "No favorites yet. Click the 󰋔 icon on any track to favorite it."
+          color: root.muted
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          horizontalAlignment: Text.AlignHCenter
+          width: parent.width - Style.space(28)
+        }
+      }
+
+      // Minimal Shortcuts Hint Bar at the very bottom
+      PanelSeparator {
         width: parent.width - Style.space(28)
+      }
+
+      Row {
+        width: parent.width - Style.space(28)
+        spacing: Style.space(12)
+        anchors.horizontalCenter: parent.horizontalCenter
+
+        Text {
+          text: "↵ Play"
+          color: root.muted
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption * 0.9
+        }
+
+        Text {
+          text: "↑/↓ Navigate"
+          color: root.muted
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption * 0.9
+        }
+
+        Text {
+          text: "󰍉 Enter to search"
+          color: root.muted
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption * 0.9
+        }
+
+        Text {
+          text: "Esc Close"
+          color: root.muted
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption * 0.9
+        }
       }
     }
   }
 
   Component.onCompleted: {
     root.refreshStatus()
+    root.refreshFavorites()
   }
 }
