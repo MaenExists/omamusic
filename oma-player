@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# oma-player: backend bridge for OmaMusic plugin talking to headless cliamp daemon
+# oma-player: resilient audio engine for OmaMusic using direct mpv IPC daemon
 set -eo pipefail
 
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omamusic"
@@ -7,8 +7,12 @@ mkdir -p "$STATE_DIR"
 STATUS_JSON="$STATE_DIR/status.json"
 QUEUE_JSON="$STATE_DIR/queue.json"
 FAVORITES_JSON="$STATE_DIR/favorites.json"
+MPV_SOCK="$STATE_DIR/mpv.sock"
+META_JSON="$STATE_DIR/current_meta.json"
 
 [ -f "$FAVORITES_JSON" ] || echo '[]' > "$FAVORITES_JSON"
+[ -f "$QUEUE_JSON" ] || echo '[]' > "$QUEUE_JSON"
+[ -f "$META_JSON" ] || echo '{}' > "$META_JSON"
 
 play_sound() {
   local snd="$1"
@@ -32,18 +36,27 @@ play_sound() {
 }
 
 ensure_daemon() {
-  if ! cliamp status >/dev/null 2>&1; then
-    # Start headless daemon with empty startup
-    cliamp -d --low-power >/dev/null 2>&1 &
+  if ! pgrep -f "mpv.*omamusic/mpv.sock" >/dev/null 2>&1 || [ ! -S "$MPV_SOCK" ]; then
+    rm -f "$MPV_SOCK"
+    mpv --no-video \
+        --idle=yes \
+        --volume=70 \
+        --audio-client-name="OmaMusic" \
+        --gapless-audio=yes \
+        --input-ipc-server="$MPV_SOCK" >/dev/null 2>&1 &
     for _ in {1..25}; do
-      if cliamp status >/dev/null 2>&1; then
-        # Ensure default tracks are wiped clean on launch
-        cliamp remote call --wait queue.clear >/dev/null 2>&1 || true
+      if [ -S "$MPV_SOCK" ]; then
         break
       fi
       sleep 0.1
     done
   fi
+}
+
+send_mpv() {
+  local cmd="$1"
+  ensure_daemon
+  echo "$cmd" | socat - "$MPV_SOCK" 2>/dev/null || echo '{"error":"socket error"}'
 }
 
 cmd="${1:-status}"
@@ -55,10 +68,9 @@ case "$cmd" in
     ;;
 
   restart-session)
-    # Terminate running cliamp daemon and clear session
-    pkill -f "cliamp -d" 2>/dev/null || true
-    pkill -f "cliamp --daemon" 2>/dev/null || true
-    sleep 0.4
+    pkill -9 -f "mpv.*omamusic/mpv.sock" 2>/dev/null || true
+    rm -f "$MPV_SOCK"
+    echo '{}' > "$META_JSON"
     ensure_daemon
     play_sound restart &
     "$0" status
@@ -66,100 +78,151 @@ case "$cmd" in
 
   status)
     ensure_daemon
-    cli_status=$(cliamp status --json 2>/dev/null || echo '{}')
-    echo "$cli_status" > "$STATUS_JSON.tmp" && mv "$STATUS_JSON.tmp" "$STATUS_JSON"
+    time_pos=$(send_mpv '{"command":["get_property","time-pos"]}' | jq -r '.data // 0' 2>/dev/null || echo '0')
+    duration=$(send_mpv '{"command":["get_property","duration"]}' | jq -r '.data // 0' 2>/dev/null || echo '0')
+    pause_state=$(send_mpv '{"command":["get_property","pause"]}' | jq -r '.data // false' 2>/dev/null || echo 'false')
+    idle_state=$(send_mpv '{"command":["get_property","idle-active"]}' | jq -r '.data // true' 2>/dev/null || echo 'true')
+    vol=$(send_mpv '{"command":["get_property","volume"]}' | jq -r '.data // 70' 2>/dev/null || echo '70')
+    meta=$(cat "$META_JSON" 2>/dev/null || echo '{}')
+
+    state="stopped"
+    if [ "$idle_state" = "false" ]; then
+      if [ "$pause_state" = "true" ]; then
+        state="paused"
+      else
+        state="playing"
+      fi
+    fi
+
+    # Output status matching OmaMusic frontend contract
+    jq -n -c \
+      --arg state "$state" \
+      --argjson pos "$time_pos" \
+      --argjson dur "$duration" \
+      --argjson vol "$vol" \
+      --argjson meta "$meta" \
+      '{
+        ok: true,
+        state: $state,
+        position: $pos,
+        duration: $dur,
+        volume: $vol,
+        track: (if ($meta.title) then $meta else null end)
+      }' > "$STATUS_JSON.tmp" && mv "$STATUS_JSON.tmp" "$STATUS_JSON"
     cat "$STATUS_JSON"
     ;;
 
   play)
-    ensure_daemon
-    cliamp play >/dev/null 2>&1 || true
+    send_mpv '{"command":["set_property","pause",false]}' >/dev/null 2>&1 || true
     play_sound play &
     "$0" status
     ;;
 
   pause)
-    ensure_daemon
-    cliamp pause >/dev/null 2>&1 || true
+    send_mpv '{"command":["set_property","pause",true]}' >/dev/null 2>&1 || true
     play_sound click &
     "$0" status
     ;;
 
   toggle)
-    ensure_daemon
-    cliamp toggle >/dev/null 2>&1 || true
-    play_sound click &
-    "$0" status
-    ;;
-
-  next)
-    ensure_daemon
-    cliamp next >/dev/null 2>&1 || true
-    play_sound click &
-    "$0" status
-    ;;
-
-  prev)
-    ensure_daemon
-    cliamp prev >/dev/null 2>&1 || true
+    send_mpv '{"command":["cycle","pause"]}' >/dev/null 2>&1 || true
     play_sound click &
     "$0" status
     ;;
 
   stop)
-    ensure_daemon
-    cliamp stop >/dev/null 2>&1 || true
+    send_mpv '{"command":["stop"]}' >/dev/null 2>&1 || true
+    echo '{}' > "$META_JSON"
     play_sound click &
     "$0" status
     ;;
 
-  volume)
-    ensure_daemon
-    val="${2:-0}"
-    if [ "$val" -gt 0 ] 2>/dev/null; then
-      if [ "$val" -le 100 ]; then
-        val_db=$(( (val - 100) * 30 / 100 ))
-        cliamp volume "$val_db" >/dev/null 2>&1 || true
-      else
-        cliamp volume 0 >/dev/null 2>&1 || true
-      fi
+  next)
+    tracks=$(cat "$QUEUE_JSON" 2>/dev/null || echo '[]')
+    first_track=$(echo "$tracks" | jq -c '.[0] // empty' 2>/dev/null || true)
+    if [ -n "$first_track" ]; then
+      url=$(echo "$first_track" | jq -r '.url')
+      title=$(echo "$first_track" | jq -r '.title')
+      artist=$(echo "$first_track" | jq -r '.artist')
+      dur=$(echo "$first_track" | jq -r '.duration')
+      # Pop track from queue
+      echo "$tracks" | jq -c '.[1:]' > "$QUEUE_JSON.tmp" && mv "$QUEUE_JSON.tmp" "$QUEUE_JSON"
+      "$0" play-url "$url" "$title" "$artist" "$dur"
     else
-      cliamp volume -30 >/dev/null 2>&1 || true
+      "$0" stop
     fi
+    ;;
+
+  prev)
+    send_mpv '{"command":["seek",0,"absolute"]}' >/dev/null 2>&1 || true
+    "$0" status
+    ;;
+
+  volume)
+    val="${2:-70}"
+    send_mpv "{\"command\":[\"set_property\",\"volume\",$val]}" >/dev/null 2>&1 || true
     "$0" status
     ;;
 
   play-url)
-    ensure_daemon
     url="$2"
+    title="${3:-Unknown Track}"
+    artist="${4:-Unknown Artist}"
+    duration_str="${5:-}"
+
     if [ -n "$url" ]; then
-      cliamp remote call --wait url.load --params "{\"path\":$(printf '%s' "$url" | jq -R .),\"play\":true}" >/dev/null 2>&1 || true
+      # Save metadata immediately
+      jq -n -c \
+        --arg title "$title" \
+        --arg artist "$artist" \
+        --arg url "$url" \
+        --arg duration "$duration_str" \
+        '{
+          title: $title,
+          artist: $artist,
+          path: $url,
+          duration_str: $duration
+        }' > "$META_JSON"
+
+      # Resolve streaming URL (fast audio format)
+      stream_url=$(yt-dlp -g -f "ba/b" "$url" 2>/dev/null || echo "$url")
+
+      # Load in mpv
+      send_mpv "{\"command\":[\"loadfile\",$(printf '%s' "$stream_url" | jq -R .),\"replace\"]}" >/dev/null 2>&1 || true
       play_sound play &
     fi
     "$0" status
     ;;
 
   queue-url)
-    ensure_daemon
     url="$2"
+    title="${3:-Unknown Track}"
+    artist="${4:-Unknown Artist}"
+    duration_str="${5:-}"
+
     if [ -n "$url" ]; then
-      cliamp remote call --wait url.load --params "{\"path\":$(printf '%s' "$url" | jq -R .),\"play\":false}" >/dev/null 2>&1 || true
+      new_track=$(jq -n -c \
+        --arg title "$title" \
+        --arg artist "$artist" \
+        --arg url "$url" \
+        --arg duration "$duration_str" \
+        '{title: $title, artist: $artist, url: $url, duration: $duration}')
+
+      jq -c --argjson item "$new_track" '. + [$item]' "$QUEUE_JSON" > "$QUEUE_JSON.tmp" \
+        && mv "$QUEUE_JSON.tmp" "$QUEUE_JSON"
+
       play_sound click &
     fi
-    "$0" status
+    "$0" queue-list
     ;;
 
   queue-list)
-    ensure_daemon
-    q_data=$(cliamp remote call --wait queue.list 2>/dev/null || echo '{}')
-    tracks=$(echo "$q_data" | jq -c '.result.tracks // []' 2>/dev/null || echo '[]')
-    idx=$(echo "$q_data" | jq -r '.result.index // -1' 2>/dev/null || echo '-1')
-    jq -n -c --argjson tracks "$tracks" --arg index "$idx" '{ok: true, tracks: $tracks, currentIndex: ($index|tonumber)}'
+    tracks=$(cat "$QUEUE_JSON" 2>/dev/null || echo '[]')
+    jq -n -c --argjson tracks "$tracks" '{ok: true, tracks: $tracks, currentIndex: 0}'
     ;;
 
   queue-clear)
-    ensure_daemon
-    cliamp remote call --wait queue.clear >/dev/null 2>&1 || true
+    echo '[]' > "$QUEUE_JSON"
     play_sound trash &
     echo '{"ok":true}'
     ;;
@@ -175,12 +238,10 @@ case "$cmd" in
       if [ -n "$id" ]; then
         exists=$(jq -r --arg id "$id" '.[] | select((.id // .url) == $id) | .id' "$FAVORITES_JSON" 2>/dev/null || true)
         if [ -n "$exists" ]; then
-          # Remove from favorites
           jq -c --arg id "$id" 'map(select((.id // .url) != $id))' "$FAVORITES_JSON" > "$FAVORITES_JSON.tmp" \
             && mv "$FAVORITES_JSON.tmp" "$FAVORITES_JSON"
           play_sound click &
         else
-          # Add to favorites
           jq -c --argjson track "$track_json" '. + [$track]' "$FAVORITES_JSON" > "$FAVORITES_JSON.tmp" \
             && mv "$FAVORITES_JSON.tmp" "$FAVORITES_JSON"
           play_sound favorite &
@@ -225,7 +286,7 @@ case "$cmd" in
     ;;
 
   *)
-    echo "Usage: $0 {ensure|restart-session|status|play|pause|toggle|next|prev|stop|volume <0-100>|play-url <url>|queue-url <url>|queue-list|queue-clear|favorites-list|favorites-toggle <json>|sound <name>|search <query> [limit]}"
+    echo "Usage: $0 {ensure|restart-session|status|play|pause|toggle|next|prev|stop|volume <0-100>|play-url <url> [title] [artist] [dur]|queue-url <url> [title] [artist] [dur]|queue-list|queue-clear|favorites-list|favorites-toggle <json>|sound <name>|search <query> [limit]}"
     exit 1
     ;;
 esac
